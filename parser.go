@@ -10,7 +10,7 @@ func ParseQuery(values url.Values) SearchQuery {
 	var filters []Filter
 	var sorts []SortOption
 
-	// فیلتر
+	// filters
 	for key, val := range values {
 		if strings.HasPrefix(key, "filter[") {
 			fieldOp := strings.TrimSuffix(strings.TrimPrefix(key, "filter["), "]") // name:eq
@@ -26,7 +26,7 @@ func ParseQuery(values url.Values) SearchQuery {
 		}
 	}
 
-	// مرتب‌سازی
+	// sorting
 	if sortStr := values.Get("sort"); sortStr != "" {
 		for _, s := range strings.Split(sortStr, ",") {
 			dir := "ASC"
@@ -41,7 +41,7 @@ func ParseQuery(values url.Values) SearchQuery {
 		}
 	}
 
-	// صفحه بندی
+	// pagination
 	limit, _ := strconv.Atoi(values.Get("limit"))
 	offset, _ := strconv.Atoi(values.Get("offset"))
 
