@@ -1,26 +1,47 @@
+````md
 # go-dbsearch
 
-🔍 **Advanced, secure, and dynamic database search package in Go.**
+Secure, dynamic search layer for GORM-based REST APIs (Gin-friendly), with:
 
-> Powerful and extensible search functionality for GORM-based REST APIs using Gin framework.
+- Query-string search (GET)
+- JSON-body advanced search (POST)
+- Safe allowlist validation (field whitelist + identifier regex)
+- Nested AND/OR groups
+- Casting for `IN` / `BETWEEN` + basic scalar types
+- Optional automatic `FieldType` inference via GORM schema
 
----
-
-## ✨ Features
-
-- ✅ Dynamic filters (`=`, `LIKE`, `IN`, `>`, `<`, `BETWEEN`)
-- ✅ Secure field validation (protection against SQL injection)
-- ✅ Full pagination support (`limit`, `offset`)
-- ✅ Multi-field sorting (`sort=name,-created_at`)
-- ✅ Search via query string or JSON body
-- ✅ Deep filter grouping (AND/OR nesting)
-- ✅ Plug-and-play handler for [Gin](https://github.com/gin-gonic/gin)
-- ✅ Works with any GORM model
-- ✅ Built-in generic handler with Go generics
+> Module: `github.com/mori-dv/go-dbsearch`  
+> Package: `go_dbsearch`
 
 ---
 
-## 📦 Installation
+## Table of contents
+
+- [Installation](#installation)
+- [Quick start (production setup)](#quick-start-production-setup)
+- [Concepts](#concepts)
+  - [Allowlist](#allowlist)
+  - [Operators](#operators)
+  - [Casting](#casting)
+  - [Nested groups](#nested-groups)
+- [GET: Query-string search](#get-query-string-search)
+  - [Filters](#filters)
+  - [Sorting](#sorting)
+  - [Pagination](#pagination)
+  - [Examples (GET)](#examples-get)
+- [POST: JSON advanced search](#post-json-advanced-search)
+  - [Request body schema](#request-body-schema)
+  - [Examples (POST)](#examples-post)
+- [Type inference from GORM model](#type-inference-from-gorm-model)
+- [Security](#security)
+- [Performance notes](#performance-notes)
+- [Compatibility](#compatibility)
+- [Recommended production checklist](#recommended-production-checklist)
+- [License](#license)
+
+---
+
+## Installation
 
 ```bash
 go get github.com/mori-dv/go-dbsearch
@@ -28,287 +49,370 @@ go get github.com/mori-dv/go-dbsearch
 
 ---
 
-## ⚙️ Setup Example
+## Quick start (production setup)
 
-### 1. Define your model
+This is the recommended “production-safe” setup:
 
-```go
-type User struct {
-    ID        uint
-    Name      string
-    Email     string
-    Age       int
-    CreatedAt time.Time
-}
-```
-
----
-
-### 2. Configure Gin + GORM + go-dbsearch
+* Use per-handler `Options` with a **non-empty allowlist**.
+* Keep `StrictJSON=true` (recommended).
+* Cap pagination with `MaxLimit`.
+* Optionally infer field types once at startup.
 
 ```go
+package main
+
 import (
-    "github.com/gin-gonic/gin"
-    "gorm.io/driver/sqlite"
-    "gorm.io/gorm"
-    "github.com/mori-dv/go-dbsearch"
+  "github.com/gin-gonic/gin"
+  "gorm.io/gorm"
+
+  go_dbsearch "github.com/mori-dv/go-dbsearch"
 )
 
-func main() {
-    db, _ := gorm.Open(sqlite.Open("test.db"), &gorm.Config{})
-    db.AutoMigrate(&User{})
+type User struct {
+  ID        uint
+  Name      string
+  Email     string
+  Age       int
+  Status    string
+  CreatedAt time.Time
+}
 
-    dbsearch.AllowedFields = map[string]bool{
-        "name":       true,
-        "email":      true,
-        "age":        true,
-        "created_at": true,
-    }
+func RegisterRoutes(r *gin.Engine, db *gorm.DB) {
+  // 1) Allow only fields you are willing to expose for search/sort
+  opts := go_dbsearch.NewOptions([]string{
+    "name", "email", "age", "status", "created_at",
+  }).
+    WithStrictJSON(true).
+    WithMaxLimit(100)
 
-    r := gin.Default()
+  // 2) Optional: infer types once at startup (recommended)
+  _ = go_dbsearch.InferFieldTypesFromModel(db, &User{}, opts)
 
-    // GET search using query string
-    r.GET("/users", dbsearch.SearchHandler[User](db, User{}))
-
-    // POST search using JSON
-    r.POST("/users/search", dbsearch.AdvancedSearchHandler[User](db, User{}))
-
-    r.Run()
+  // 3) Register handlers
+  r.GET("/users", go_dbsearch.SearchHandlerWithOptions[User](db, User{}, opts))
+  r.POST("/users/search", go_dbsearch.AdvancedSearchHandlerWithOptions[User](db, User{}, opts))
 }
 ```
 
 ---
 
-## 🔍 Search via Query String (GET)
+## Concepts
 
-### 🧪 Sample Request
+### Allowlist
 
-```http
-GET /users?filter[name:like]=john&filter[age:>]=18&filter[created_at:between]=2023-01-01,2023-12-31&sort=-age&limit=10&offset=0
-```
+To prevent SQL injection through identifiers, this library requires a **field allowlist**:
 
-### 🔗 Supported Filter Operators
+* `Options.AllowedFields` must contain the only fields that can be used in `filter.field` and `sort.field`.
 
-| Operator  | Meaning            | Example                                            |
-| --------- | ------------------ | -------------------------------------------------- |
-| `=`       | Equals             | `filter[age:=]=30`                                 |
-| `LIKE`    | Partial match      | `filter[name:like]=john`                           |
-| `>` / `<` | Greater/Less than  | `filter[age:>]=25`                                 |
-| `IN`      | In list            | `filter[status:in]=active,inactive`                |
-| `BETWEEN` | Between two values | `filter[created_at:between]=2023-01-01,2023-12-31` |
+Examples:
 
-### 🔁 Sorting
+* ✅ Allowed: `"name"`, `"users.email"`, `"created_at"`
+* ❌ Not allowed: `"name; DROP TABLE users"`, `"CASE WHEN ..."`, `"LOWER(email)"`
 
-```http
-sort=-age,name
-```
+In addition to allowlist, the library also rejects unsafe identifier characters using:
 
-* `-` prefix for descending.
-* Multi-field supported.
+* `^[a-zA-Z0-9_.]+$`
 
 ---
 
-## 🧾 Search via JSON (POST)
+### Operators
 
-### 📥 Endpoint
+Canonical operators:
 
-```http
-POST /users/search
-Content-Type: application/json
+* `=`, `>`, `<`, `>=`, `<=`
+* `LIKE`
+* `IN`
+* `BETWEEN`
+
+Aliases (case-insensitive):
+
+* `eq`, `gt`, `lt`, `gte`, `lte`
+* `like`, `in`, `between`
+
+So these are equivalent:
+
+* `op: "eq"` and `op: "="`
+* `op: "like"` and `op: "LIKE"`
+
+---
+
+### Casting
+
+Casting is driven by `Options.FieldTypes`:
+
+```go
+opts.WithFieldTypes(map[string]go_dbsearch.FieldType{
+  "age":        go_dbsearch.FieldTypeInt,
+  "created_at": go_dbsearch.FieldTypeDate, // "2006-01-02"
+})
 ```
 
-### 📤 Request Body Example
+If `FieldTypes` is empty, you can infer it from the GORM model schema:
+
+```go
+_ = go_dbsearch.InferFieldTypesFromModel(db, &User{}, opts)
+```
+
+Supported types:
+
+* `string`, `int`, `int64`, `float64`, `bool`, `date`, `time`
+
+Formats:
+
+* `date`: `"2006-01-02"` (UTC midnight)
+* `time`: RFC3339 (`"2023-01-02T15:04:05Z"`) or `"2006-01-02 15:04:05"`
+
+`IN` / `BETWEEN` behavior:
+
+* GET `IN`: `a,b,c` → `[]interface{}{...}`
+* GET `BETWEEN`: `a,b` → `[]interface{}{lo,hi}`
+* JSON `IN`: `"a,b"` or array `["a","b"]`
+* JSON `BETWEEN`: `"a,b"` or array `[lo,hi]`
+
+---
+
+### Nested groups
+
+JSON advanced search supports nested AND/OR groups at arbitrary depth.
+
+Example structure:
+
+* `(age >= 18) AND (status IN (...) OR email LIKE '%gmail%')`
+
+---
+
+## GET: Query-string search
+
+### Filters
+
+Format:
+
+```
+filter[field:op]=value
+```
+
+Examples:
+
+* Equals:
+  `filter[name:eq]=Alice`
+* Greater-than:
+  `filter[age:gt]=18`
+* LIKE:
+  `filter[email:like]=@gmail.com`
+* IN:
+  `filter[status:in]=active,inactive,pending`
+* BETWEEN:
+  `filter[created_at:between]=2024-01-01,2024-12-31`
+
+Notes:
+
+* Invalid fields (not in allowlist) are ignored in GET mode (permissive parsing).
+* Invalid casts cause the specific filter to be ignored.
+
+---
+
+### Sorting
+
+Format:
+
+```
+sort=name,-created_at
+```
+
+* `name` → `ASC`
+* `-created_at` → `DESC`
+
+Only allowlisted fields can be used for sorting.
+
+---
+
+### Pagination
+
+Format:
+
+```
+limit=10&offset=0
+```
+
+If `Options.MaxLimit > 0`, the requested `limit` is capped to that value.
+
+---
+
+### Examples (GET)
+
+#### 1) Basic filters + sort + pagination
+
+```
+GET /users?filter[name:like]=ali&filter[age:gte]=18&sort=-created_at&limit=20&offset=0
+```
+
+#### 2) IN filter
+
+```
+GET /users?filter[status:in]=active,pending
+```
+
+#### 3) BETWEEN filter (date)
+
+```
+GET /users?filter[created_at:between]=2024-01-01,2024-12-31
+```
+
+---
+
+## POST: JSON advanced search
+
+### Request body schema
 
 ```json
 {
   "filters": {
-    "or": [
+    "and": [
+      { "filter": { "field": "age", "op": ">=", "value": 18 } },
       {
-        "filter": {
-          "field": "name",
-          "op": "like",
-          "value": "john"
-        }
-      },
-      {
-        "group": {
-          "and": [
-            {
-              "filter": {
-                "field": "email",
-                "op": "like",
-                "value": "@gmail"
-              }
-            },
-            {
-              "filter": {
-                "field": "age",
-                "op": ">",
-                "value": 25
-              }
-            }
-          ]
-        }
+        "or": [
+          { "filter": { "field": "status", "op": "in", "value": ["active","pending"] } },
+          { "filter": { "field": "email", "op": "like", "value": "@gmail.com" } }
+        ]
       }
     ]
   },
   "sort": [
     { "field": "created_at", "direction": "desc" }
   ],
-  "pagination": {
-    "limit": 10,
-    "offset": 0
-  }
+  "pagination": { "limit": 20, "offset": 0 }
 }
 ```
 
-### 📥 JSON Schema
+Validation behavior:
+
+* With `StrictJSON=true` (recommended), invalid input returns **HTTP 400**:
+
+  * Unknown field (not allowlisted)
+  * Unsupported operator
+  * Invalid `sort.direction`
+  * Type casting failure (if FieldTypes is configured)
+
+---
+
+### Examples (POST)
+
+#### 1) Nested groups
 
 ```json
 {
   "filters": {
-    "or": [
-      { "filter": { "field": "...", "op": "...", "value": ... } },
+    "and": [
+      { "filter": { "field": "age", "op": ">=", "value": 18 } },
       {
-        "group": {
-          "and": [ ... ],
-          "or": [ ... ]
-        }
+        "or": [
+          { "filter": { "field": "status", "op": "in", "value": "active,pending" } },
+          { "filter": { "field": "email", "op": "like", "value": "@gmail.com" } }
+        ]
       }
     ]
   },
-  "sort": [
-    { "field": "fieldname", "direction": "asc|desc" }
-  ],
-  "pagination": {
-    "limit": 10,
-    "offset": 0
+  "sort": [{ "field": "created_at", "direction": "desc" }],
+  "pagination": { "limit": 50, "offset": 0 }
+}
+```
+
+#### 2) BETWEEN with array
+
+```json
+{
+  "filters": {
+    "and": [
+      { "filter": { "field": "created_at", "op": "between", "value": ["2024-01-01","2024-12-31"] } }
+    ]
   }
 }
 ```
 
 ---
 
-## 🔐 Security
+## Type inference from GORM model
 
-* ✅ Only whitelisted fields can be queried via `dbsearch.AllowedFields`
-* ✅ All values are parameterized (protected from SQL injection)
-* ✅ Unsupported fields or operators are ignored
-
----
-
-## 🧩 Integrations
-
-| Framework | Support                |
-| --------- | ---------------------- |
-| GORM      | ✅ Fully supported      |
-| Gin       | ✅ Plug & play handlers |
-| Echo      | ⏳ (Coming soon)        |
-| Fiber     | ⏳ (Coming soon)        |
-
----
-
-## 📌 Roadmap
-
-* [x] Dynamic query string parsing
-* [x] Between support
-* [x] Nested filters with AND/OR logic
-* [x] JSON body support for POST
-* [ ] Caching layer for repeated queries
-* [ ] Full-text search integration (PostgreSQL, SQLite FTS)
-* [ ] Query export for GraphQL compatibility
-
----
-
-## 🤝 Contributing
-
-Contributions and feature requests are welcome. Fork the repo and submit a pull request 🙌
-
----
-
-## 📄 License
-
-MIT License — use freely and responsibly.
-
----
-
-## 🧠 Inspiration
-
-Built for scalable, safe, and expressive filtering in modern backend APIs.
-
-### How It Works
-
-- The core handlers (`SearchHandler`, `AdvancedSearchHandler`) are **generic** (`[T any]`), so you can use them for any GORM model: `User`, `Product`, `Order`, etc.
-- You only need to:
-  1. Register the allowed fields for each model.
-  2. Register the handler for each model’s endpoint.
-
----
-
-## Example: Use for Multiple Models
-
-Suppose you have these models:
+To avoid manually maintaining `FieldTypes`, you can infer them from a GORM model:
 
 ```go
-type User struct {
-    ID    uint
-    Name  string
-    Email string
-    Age   int
-}
+opts := go_dbsearch.NewOptions([]string{"name","age","created_at"}).
+  WithStrictJSON(true).
+  WithMaxLimit(100)
 
-type Product struct {
-    ID    uint
-    Name  string
-    Price float64
-    Stock int
+if err := go_dbsearch.InferFieldTypesFromModel(db, &User{}, opts); err != nil {
+  // handle error
 }
 ```
 
-### 1. Register Allowed Fields
+Notes:
 
-```go
-dbsearch.AllowedFields = map[string]bool{
-    // User fields
-    "id": true, "name": true, "email": true, "age": true,
-    // Product fields
-    "price": true, "stock": true,
-}
+* Inference is best-effort.
+* `time.Time` fields map to `FieldTypeTime`.
+* If you need date-only behavior, override manually:
+  `opts.FieldTypes["created_at"] = go_dbsearch.FieldTypeDate`
+
+---
+
+## Security
+
+This library prevents SQL injection by:
+
+1. **Field allowlist**: only allowlisted identifiers can be used.
+2. **Identifier regex check**: only `[a-zA-Z0-9_.]` characters are allowed in identifiers.
+3. **Parameterized values**: values are always passed as `?` parameters to GORM.
+
+Production recommendations:
+
+* Keep allowlist small and explicit.
+* Set `StrictJSON=true`.
+* Cap `limit` using `MaxLimit`.
+* Add DB indexes for the most-used filter/sort fields.
+
+Non-goals:
+
+* Function-based filters like `LOWER(email)` are intentionally not supported (unsafe).
+* Authorization rules are not handled; your allowlist must match your auth policy.
+
+---
+
+## Performance notes
+
+Dynamic filtering can be expensive without indexes.
+For production:
+
+* Add indexes for commonly filtered/sorted columns.
+* Set a reasonable `MaxLimit`.
+* Consider restricting operators exposed to public endpoints.
+
+---
+
+## Compatibility
+
+* Go: 1.22+
+* GORM: v2
+* Gin: supported via provided handlers (the core logic can be used without Gin).
+
+---
+
+## Recommended production checklist
+
+* [ ] Provide a non-empty allowlist (`Options.AllowedFields`)
+* [ ] `StrictJSON=true`
+* [ ] Set `MaxLimit` (e.g. 100)
+* [ ] Add DB indexes for filter/sort columns
+* [ ] Run: `go test ./...`
+* [ ] Run: `go vet ./...`
+* [ ] Run: `golangci-lint run`
+* [ ] Add CI workflow (GitHub Actions)
+* [ ] Tag releases with SemVer (e.g. `v2.0.0`)
+
+---
+
+## License
+
+See `LICENSE`.
+
 ```
-
-### 2. Register Handlers
-
-```go
-r.GET("/users", dbsearch.SearchHandler[User](db, User{}))
-r.POST("/users/search", dbsearch.AdvancedSearchHandler[User](db, User{}))
-
-r.GET("/products", dbsearch.SearchHandler[Product](db, Product{}))
-r.POST("/products/search", dbsearch.AdvancedSearchHandler[Product](db, Product{}))
+::contentReference[oaicite:0]{index=0}
 ```
-
-### 3. That’s it!
-
-- You now have full-featured, dynamic search endpoints for every model.
-- You can add as many models as you want—just add their fields to `AllowedFields` and register the handlers.
-
----
-
-## Notes
-
-- **Field Whitelisting:** All searchable/sortable fields for all models must be in `AllowedFields`.
-- **Security:** Only fields in `AllowedFields` can be queried, so you’re protected from SQL injection and accidental data leaks.
-- **No Code Duplication:** You don’t need to write custom search logic for each model.
-
----
-
-## Advanced: Per-Model Allowed Fields
-
-If you want different allowed fields per model, you can:
-- Use a map of model name → allowed fields, and set `dbsearch.AllowedFields` before each handler runs (using middleware or handler wrapper).
-- Or, fork/extend the package to support per-model field whitelists.
-
----
-
-**Summary:**  
-You can use this package for every model in your database, with minimal setup.  
-If you want a code template for multiple models, or want to see how to do per-model field whitelisting, just ask!
